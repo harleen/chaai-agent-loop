@@ -210,20 +210,20 @@ def run_agent(
             return f"Opened {url} in the default browser."
         return f"Could not open a browser for {url} (no browser available in this environment)."
 
+    _trim_note_state = {"next_warn_at": max_context_messages}
+
     def _trim_hook(state: dict) -> dict:
         """pre_model_hook — bounds what's sent to the model to the most recent
         max_context_messages, without touching the permanently persisted `messages`
         state (returning llm_input_messages does NOT overwrite the checkpoint). Trims
         safely around tool-call/tool-response pairs (start_on="human") so a ToolMessage
-        never gets separated from the AIMessage that triggered it."""
+        never gets separated from the AIMessage that triggered it.
+
+        Runs on every model call, including each tool-call round trip within a single
+        turn — so once a session is past max_context_messages, both the terminal note
+        and the in-context note below are throttled/scoped to avoid firing repeatedly
+        for what the human sees as one turn."""
         messages = state["messages"]
-        if len(messages) > max_context_messages:
-            print(
-                f"\n[Note: this session has grown to {len(messages)} messages — sending "
-                f"only the most recent {max_context_messages} to the model. Full history "
-                f"stays saved; use recall_earlier_messages to look further back.]\n",
-                flush=True,
-            )
         trimmed = trim_messages(
             messages,
             max_tokens=max_context_messages,
@@ -231,6 +231,33 @@ def run_agent(
             strategy="last",
             start_on="human",
         )
+        if len(messages) > max_context_messages:
+            hidden = len(messages) - len(trimmed)
+            # The model can't otherwise tell that older messages are missing from
+            # what it's being shown this turn — say so inline, every time trimming
+            # is active, so it knows to reach for recall_earlier_messages when the
+            # user references something that isn't visible above.
+            trimmed = [
+                SystemMessage(
+                    content=(
+                        f"[Context note: {hidden} earlier message(s) in this session "
+                        f"are not shown above. Call recall_earlier_messages to search "
+                        f"further back if the user references something not visible "
+                        f"here.]"
+                    )
+                )
+            ] + trimmed
+
+            # The terminal note is for the human operator — only worth repeating
+            # every so often, not on every single model call.
+            if len(messages) >= _trim_note_state["next_warn_at"]:
+                print(
+                    f"\n[Note: this session has grown to {len(messages)} messages — sending "
+                    f"only the most recent {max_context_messages} to the model. Full history "
+                    f"stays saved; use recall_earlier_messages to look further back.]\n",
+                    flush=True,
+                )
+                _trim_note_state["next_warn_at"] = len(messages) + 25
         return {"llm_input_messages": trimmed}
 
     all_tools = list(tools) + [get_model_provider, open_in_browser]
