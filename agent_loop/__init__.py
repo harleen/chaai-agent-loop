@@ -25,7 +25,9 @@ Usage:
 import base64
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import warnings
 import webbrowser
 from pathlib import Path
@@ -630,33 +632,74 @@ _IMAGE_MIME = {
     ".webp": "image/webp",
 }
 
+# Formats the API can't take (HEIC from iPhone) or files too big for it
+# (5MB limit) get converted to a downscaled JPEG with macOS's built-in sips.
+_CONVERT_EXTS   = {".heic", ".heif"}
+_MAX_IMAGE_SIZE = 4 * 1024 * 1024
+
+# Matches each image path in the input: either quoted ('/a b/c.png') or bare
+# with Finder-style escaped spaces (/a\ b/c.png). Several per line is fine.
+_IMAGE_EXT_RE  = r"\.(?:png|jpe?g|gif|webp|heic|heif)"
+_IMAGE_PATH_RE = re.compile(
+    rf"""'((?:/|~)[^']+?{_IMAGE_EXT_RE})'"""
+    rf"""|"((?:/|~)[^"]+?{_IMAGE_EXT_RE})\""""
+    rf"""|((?:/|~)(?:\\ |[^\s'"])+?{_IMAGE_EXT_RE})(?=$|[\s'"])""",
+    re.IGNORECASE,
+)
+
+
+def _load_image(img_path: Path) -> tuple[str, bytes]:
+    """Return (mime, bytes), converting to JPEG via sips if needed."""
+    suffix = img_path.suffix.lower()
+    if suffix not in _CONVERT_EXTS and img_path.stat().st_size <= _MAX_IMAGE_SIZE:
+        return _IMAGE_MIME[suffix], img_path.read_bytes()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "converted.jpg"
+        subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", "2000", str(img_path), "--out", str(out)],
+            check=True, capture_output=True,
+        )
+        return "image/jpeg", out.read_bytes()
+
 
 def _build_message(user_input: str) -> dict:
     """
-    Build a user message. If the input contains an image file path (e.g. from
-    Finder drag-in), encode the image as base64 and return a multimodal message
-    so Claude can actually see it.
+    Build a user message. If the input contains image file paths (e.g. from
+    Finder drag-in), encode each as base64 and return a multimodal message
+    so Claude can actually see them.
     """
-    path_match = re.search(r'(/[^\n\'"]+\.(?:png|jpg|jpeg|gif|webp))', user_input, re.IGNORECASE)
-    if not path_match:
+    matches = list(_IMAGE_PATH_RE.finditer(user_input))
+    if not matches:
         return {"role": "user", "content": user_input}
 
-    raw_path  = path_match.group(1).replace("\\ ", " ")
-    img_path  = Path(raw_path)
-    text_part = user_input[:path_match.start()].strip() or "Here is the screenshot."
+    image_blocks = []
+    for m in matches:
+        raw_path = next(g for g in m.groups() if g).replace("\\ ", " ")
+        img_path = Path(raw_path).expanduser()
+        if not img_path.exists():
+            print(f"  [image not found: {img_path}]")
+            continue
+        try:
+            mime, data = _load_image(img_path)
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"  [couldn't read image {img_path.name}: {e}]")
+            continue
+        b64_data = base64.standard_b64encode(data).decode()
+        image_blocks.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_data}"}}
+        )
 
-    if not img_path.exists():
+    if not image_blocks:
         return {"role": "user", "content": user_input}
 
-    mime     = _IMAGE_MIME.get(img_path.suffix.lower(), "image/png")
-    b64_data = base64.standard_b64encode(img_path.read_bytes()).decode()
+    text_part = _IMAGE_PATH_RE.sub("", user_input).strip()
+    if not text_part:
+        text_part = "Here is the image." if len(image_blocks) == 1 else "Here are the images."
 
     return {
         "role": "user",
-        "content": [
-            {"type": "text",      "text": text_part},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_data}"}},
-        ],
+        "content": [{"type": "text", "text": text_part}, *image_blocks],
     }
 
 
