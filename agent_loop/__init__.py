@@ -52,6 +52,8 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
 from langgraph.checkpoint.sqlite import SqliteSaver
+
+from .memory import MEMORY_TOOL_NAMES, VERBATIM_MEMORY_TOOLS, MemoryStore, memory_tools
 from langgraph.prebuilt import create_react_agent
 
 # Terminal color codes — swap _ASSISTANT value to change response color:
@@ -119,6 +121,7 @@ def run_agent(
     max_context_messages: int = 50,
     preferences_path: "str | Path | None" = None,
     preference_categories: "list[str] | None" = None,
+    memory_path: "str | Path | None" = None,
 ) -> None:
     """
     Build a LangGraph ReAct agent and start the terminal conversation loop.
@@ -154,11 +157,22 @@ def run_agent(
                               preferences_path is set. Describe what each category is for
                               in your own system_prompt — the tool's own description
                               stays generic/project-agnostic.
+        memory_path:          Optional path to this assistant's memory.db: general memory
+                              that holds beyond any one piece of work (principles,
+                              preferences, facts). Adds remember, correct, forget, recall
+                              and approve, and loads every saved memory into the system
+                              prompt. What the model infers itself waits as a pending
+                              suggestion until approved. See agent_loop/memory.py.
     """
     if preferences_path is not None:
         system_prompt = system_prompt + _load_preferences_block(
             Path(preferences_path), preference_categories or []
         )
+
+    memory_store = None
+    if memory_path is not None:
+        memory_store = MemoryStore(memory_path)
+        system_prompt = system_prompt + memory_store.prompt_block()
 
     if model_provider == "openai":
         if ChatOpenAI is None:
@@ -303,6 +317,13 @@ def run_agent(
 
         all_tools = all_tools + [save_preference]
         extra_auto_approve = {"save_preference"}
+
+    # Memory writes are local and never delete; the user's control is that only what
+    # they asked for is saved, the rest waits as a suggestion.
+    if memory_store is not None:
+        all_tools = all_tools + memory_tools(memory_store, thread_id)
+        extra_auto_approve = extra_auto_approve | MEMORY_TOOL_NAMES
+        verbatim_tool_names = list(verbatim_tool_names or []) + VERBATIM_MEMORY_TOOLS
 
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         config = {"configurable": {"thread_id": thread_id}}
