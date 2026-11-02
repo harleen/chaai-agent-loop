@@ -4,3 +4,9 @@ __pycache__/
 .DS_Store
 dist/
 build/
+
+# Real people's data: never in this public repo
+*.csv
+contact_classifier/*.csv
+*token*.json
+*credentials*.json
