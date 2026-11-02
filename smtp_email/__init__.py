@@ -2,7 +2,7 @@
 SMTP email sending — no OAuth, no token expiry.
 
 Usage:
-    from smtp_utils import send_email
+    from smtp_email import send_email
 
     send_email(
         to="you@example.com",

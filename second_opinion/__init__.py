@@ -1,5 +1,5 @@
 """
-llm_tools — cross-harness escalation tools.
+second_opinion — ask another model one hard question.
 
 Stateless, single-turn "ask a different model" calls, meant to be dropped into
 any agent_loop harness's tools list — most commonly so a local-model harness
@@ -11,7 +11,7 @@ no system prompt beyond what you pass in. They are not a replacement for the
 harness's main model, just a one-off "phone a friend."
 
 Usage:
-    from llm_tools import ask_claude, ask_gpt
+    from second_opinion import ask_claude, ask_gpt
 
     run_agent(
         tools=[..., ask_claude, ask_gpt],
@@ -25,7 +25,6 @@ respective tool — same as the rest of the stack.
 from langchain_core.tools import tool
 
 import anthropic
-import openai
 
 
 @tool
@@ -55,6 +54,10 @@ def ask_gpt(question: str, model: str = "gpt-5.5") -> str:
     confident answering well — e.g. nuanced interpretation, careful wording.
     No conversation history or other tools are shared with this call.
     """
+    try:
+        import openai  # optional: the `openai` extra
+    except ImportError:
+        return "ask_gpt needs the openai package: pip install 'chaai-agent-loop[openai]'"
     client = openai.OpenAI()
     response = client.chat.completions.create(
         model=model,

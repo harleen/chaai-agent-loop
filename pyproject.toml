@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-loop"
+name = "chaai-agent-loop"
 version = "0.1.0"
-description = "Reusable LangGraph ReAct agent harness — terminal loop, image support, interrupt-before-tools approval"
+description = "A LangGraph ReAct harness for terminal assistants: approval before every tool, images, saved conversations and general memory"
 requires-python = ">=3.11"
 # Pinned with ~= (compatible release): patch updates install automatically,
 # minor bumps require deliberate bump here + test. Upgrade intentionally,
@@ -15,6 +15,7 @@ dependencies = [
     "langgraph~=1.2",
     "langgraph-checkpoint-sqlite~=3.1",
     "anthropic~=0.104",
+    "prompt-toolkit~=3.0",
 ]
 
 [tool.setuptools.packages.find]
