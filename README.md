@@ -130,7 +130,7 @@ One standalone question to a stronger cloud model, with no shared history or too
 ## Tests and evals
 
 ```bash
-python -m unittest agent_loop.tests.test_memory      # 23 tests, no model, under a second
+python -m unittest discover -s agent_loop/tests -t .  # 27 tests, no model or key, under a second
 python -m agent_loop.evals.memory_eval openai gpt-5.5
 python -m agent_loop.evals.memory_eval anthropic claude-haiku-4-5
 python -m agent_loop.evals.memory_eval ollama qwen3:8b
