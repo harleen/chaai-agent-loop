@@ -2,7 +2,7 @@
 
 A LangGraph ReAct harness for terminal assistants, and the small tools they share. Each new assistant needs only a system prompt and its tools: the loop, approval before every tool call, images, saved conversations and memory come with it.
 
-Built by Harleen Serai (Cha.AI) for her own assistants: a poetry submissions assistant, a collaborator for translating South Asian poetry, a bank reconciliation agent and a Punjabi worksheet author.
+Built by Harleen Serai (Cha.AI) and used by her own agents for submissions, translation notes and everyday admin.
 
 ## What's in it
 
