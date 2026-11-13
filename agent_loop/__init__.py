@@ -3,7 +3,8 @@ agent_loop — reusable LangGraph ReAct agent harness for terminal apps.
 
 Provides a conversational loop with:
   - interrupt_before=["tools"] — pause before every tool call for user approval
-  - image support — drag a file from Finder, Claude sees the actual image
+  - image support — drag a file from Finder, Claude sees the actual image; the
+    photo is stored beside the DB and only a reference is checkpointed (images.py)
   - clean Ctrl+C handling — orphaned tool calls are closed out so the DB stays valid
   - verbatim tool output — named tools print their output directly, bypassing
     Claude's tendency to summarize
@@ -22,12 +23,9 @@ Usage:
     )
 """
 
-import base64
 import json
 import re
-import subprocess
 import sys
-import tempfile
 import warnings
 import webbrowser
 from pathlib import Path
@@ -53,6 +51,7 @@ except ImportError:
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from .images import ImageStore, add_images, build_message
 from .memory import MEMORY_TOOL_NAMES, VERBATIM_MEMORY_TOOLS, MemoryStore, memory_tools
 from langgraph.prebuilt import create_react_agent
 
@@ -228,10 +227,14 @@ def run_agent(
 
     _trim_note_state = {"next_warn_at": max_context_messages}
 
-    def _trim_hook(state: dict) -> dict:
-        """pre_model_hook — bounds what's sent to the model to the most recent
-        max_context_messages, without touching the permanently persisted `messages`
-        state (returning llm_input_messages does NOT overwrite the checkpoint). Trims
+    image_store = ImageStore(Path(db_path).with_name(Path(db_path).stem + "-images"))
+
+    def _prompt(state: dict) -> list:
+        """The agent's prompt function — builds exactly what the model sees on each
+        call: the system message, the most recent max_context_messages, and the
+        actual images behind any image references. Nothing it returns is
+        checkpointed (unlike a pre_model_hook's llm_input_messages, which is saved
+        with every step), so photos never land in the DB. Trims
         safely around tool-call/tool-response pairs (start_on="human") so a ToolMessage
         never gets separated from the AIMessage that triggered it.
 
@@ -274,7 +277,7 @@ def run_agent(
                     flush=True,
                 )
                 _trim_note_state["next_warn_at"] = len(messages) + 25
-        return {"llm_input_messages": trimmed}
+        return [system_msg, *add_images(trimmed, image_store)]
 
     all_tools = list(tools) + [get_model_provider, open_in_browser]
     extra_auto_approve: set = set()
@@ -435,13 +438,17 @@ def run_agent(
             model_obj,
             tools=all_tools + [recall_earlier_messages],
             checkpointer=checkpointer,
-            prompt=system_msg,
+            prompt=_prompt,
             interrupt_before=["tools"],
-            pre_model_hook=_trim_hook,
+            # v1 runs all of a turn's tool calls in one node. The default v2 sends each
+            # call to the tool node with its own copy of the full state, and every copy
+            # is checkpointed: 7 calls on a thread with photos made one 149 MB row.
+            # Calls are approved one turn at a time anyway, so v2's parallelism isn't used.
+            version="v1",
         )
 
         _conversation_loop(
-            graph, config,
+            graph, config, image_store,
             fresh_start_message=fresh_start_message,
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
@@ -478,7 +485,7 @@ def _multiline_prompt(label: str) -> str:
 
 # ── conversation loop ─────────────────────────────────────────────────────────
 
-def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming=False):
+def _conversation_loop(graph, config, image_store, fresh_start_message, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming=False):
     existing = graph.get_state(config)
     tid = config["configurable"]["thread_id"]
 
@@ -495,10 +502,10 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
 
     if existing.values:
         print(f"\n[Resuming — {tid}]\n")
-        _run_turn(graph, config, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming)
+        _run_turn(graph, config, image_store, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming)
     else:
         print(f"\n[New session — {tid}]\n")
-        _run_turn(graph, config, fresh_start_message, verbatim_tool_names, auto_approve_tool_names, streaming)
+        _run_turn(graph, config, image_store, fresh_start_message, verbatim_tool_names, auto_approve_tool_names, streaming)
 
     while True:
         try:
@@ -513,18 +520,18 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
             print("Session saved. Goodbye.")
             break
 
-        _run_turn(graph, config, user_input, verbatim_tool_names, auto_approve_tool_names, streaming)
+        _run_turn(graph, config, image_store, user_input, verbatim_tool_names, auto_approve_tool_names, streaming)
 
 
 # ── turn execution ────────────────────────────────────────────────────────────
 
-def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_approve_tool_names: set, streaming: bool = False) -> None:
+def _run_turn(graph, config, image_store: ImageStore, user_input: str, verbatim_tool_names: list, auto_approve_tool_names: set, streaming: bool = False) -> None:
     """
     Send one message and run until the agent finishes responding.
     Handles the interrupt_before=["tools"] pause loop internally.
     Read-only tools in auto_approve_tool_names proceed without prompting.
     """
-    _stream_and_print(graph, config, {"messages": [_build_message(user_input)]}, verbatim_tool_names, streaming)
+    _stream_and_print(graph, config, {"messages": [build_message(user_input, image_store)]}, verbatim_tool_names, streaming)
 
     while True:
         state = graph.get_state(config)
@@ -641,87 +648,6 @@ def _print_ai_text(msg) -> None:
         return
     if text:
         print(f"\n{_ASSISTANT}Assistant: {text}{_RESET}\n")
-
-
-# ── image support ─────────────────────────────────────────────────────────────
-
-_IMAGE_MIME = {
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif":  "image/gif",
-    ".webp": "image/webp",
-}
-
-# Formats the API can't take (HEIC from iPhone) or files too big for it
-# (5MB limit) get converted to a downscaled JPEG with macOS's built-in sips.
-_CONVERT_EXTS   = {".heic", ".heif"}
-_MAX_IMAGE_SIZE = 4 * 1024 * 1024
-
-# Matches each image path in the input: either quoted ('/a b/c.png') or bare
-# with Finder-style escaped spaces (/a\ b/c.png). Several per line is fine.
-_IMAGE_EXT_RE  = r"\.(?:png|jpe?g|gif|webp|heic|heif)"
-_IMAGE_PATH_RE = re.compile(
-    rf"""'((?:/|~)[^']+?{_IMAGE_EXT_RE})'"""
-    rf"""|"((?:/|~)[^"]+?{_IMAGE_EXT_RE})\""""
-    rf"""|((?:/|~)(?:\\ |[^\s'"])+?{_IMAGE_EXT_RE})(?=$|[\s'"])""",
-    re.IGNORECASE,
-)
-
-
-def _load_image(img_path: Path) -> tuple[str, bytes]:
-    """Return (mime, bytes), converting to JPEG via sips if needed."""
-    suffix = img_path.suffix.lower()
-    if suffix not in _CONVERT_EXTS and img_path.stat().st_size <= _MAX_IMAGE_SIZE:
-        return _IMAGE_MIME[suffix], img_path.read_bytes()
-
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "converted.jpg"
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", "-Z", "2000", str(img_path), "--out", str(out)],
-            check=True, capture_output=True,
-        )
-        return "image/jpeg", out.read_bytes()
-
-
-def _build_message(user_input: str) -> dict:
-    """
-    Build a user message. If the input contains image file paths (e.g. from
-    Finder drag-in), encode each as base64 and return a multimodal message
-    so Claude can actually see them.
-    """
-    matches = list(_IMAGE_PATH_RE.finditer(user_input))
-    if not matches:
-        return {"role": "user", "content": user_input}
-
-    image_blocks = []
-    for m in matches:
-        raw_path = next(g for g in m.groups() if g).replace("\\ ", " ")
-        img_path = Path(raw_path).expanduser()
-        if not img_path.exists():
-            print(f"  [image not found: {img_path}]")
-            continue
-        try:
-            mime, data = _load_image(img_path)
-        except (OSError, subprocess.CalledProcessError) as e:
-            print(f"  [couldn't read image {img_path.name}: {e}]")
-            continue
-        b64_data = base64.standard_b64encode(data).decode()
-        image_blocks.append(
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_data}"}}
-        )
-
-    if not image_blocks:
-        return {"role": "user", "content": user_input}
-
-    text_part = _IMAGE_PATH_RE.sub("", user_input).strip()
-    if not text_part:
-        text_part = "Here is the image." if len(image_blocks) == 1 else "Here are the images."
-
-    return {
-        "role": "user",
-        "content": [{"type": "text", "text": text_part}, *image_blocks],
-    }
 
 
 # ── interrupt state management ────────────────────────────────────────────────
