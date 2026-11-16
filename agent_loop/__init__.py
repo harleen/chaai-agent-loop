@@ -24,6 +24,7 @@ Usage:
 """
 
 import json
+import os
 import re
 import sys
 import warnings
@@ -121,6 +122,7 @@ def run_agent(
     preferences_path: "str | Path | None" = None,
     preference_categories: "list[str] | None" = None,
     memory_path: "str | Path | None" = None,
+    ollama_context_tokens: int = 16384,
 ) -> None:
     """
     Build a LangGraph ReAct agent and start the terminal conversation loop.
@@ -132,7 +134,10 @@ def run_agent(
                               Each thread_id gets its own history in the DB.
         db_path:              Path to the SQLite checkpoint file (created if not exists)
         fresh_start_message:  Auto-sent on first run to kick the agent off
-        resume_message:       Auto-sent when resuming a prior session
+        resume_message:       Auto-sent when resuming a prior session. Both are
+                              replaced by the request itself when the assistant
+                              was opened by chaai, which passes it in the
+                              CHAAI_REQUEST environment variable.
         verbatim_tool_names:  Tools whose output is printed directly to the terminal,
                               bypassing Claude's summarization. Useful when the tool
                               output is structured for human reading (e.g. journal entries).
@@ -162,6 +167,10 @@ def run_agent(
                               and approve, and loads every saved memory into the system
                               prompt. What the model infers itself waits as a pending
                               suggestion until approved. See agent_loop/memory.py.
+        ollama_context_tokens: Ollama's context window (num_ctx). Ollama's own default
+                              (4096 here) is smaller than poetry's prompt and tools,
+                              and Ollama drops what doesn't fit from the front, the
+                              system prompt first, without saying so.
     """
     if preferences_path is not None:
         system_prompt = system_prompt + _load_preferences_block(
@@ -189,6 +198,7 @@ def run_agent(
             # Reasoning itself is left on: tool selection benefits from it, and the
             # harness's tasks are bounded tool calls, not open-ended generation.
             num_predict=8192,
+            num_ctx=ollama_context_tokens,
             client_kwargs={"timeout": 300},
         )
         system_msg = SystemMessage(content=system_prompt)
@@ -447,10 +457,12 @@ def run_agent(
             version="v1",
         )
 
+        # Popped, so tools that start subprocesses don't pass it on.
+        request = os.environ.pop("CHAAI_REQUEST", "").strip()
         _conversation_loop(
             graph, config, image_store,
-            fresh_start_message=fresh_start_message,
-            resume_message=resume_message,
+            fresh_start_message=request or fresh_start_message,
+            resume_message=request or resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
             auto_approve_tool_names=set(auto_approve_tool_names or []) | _BUILTIN_AUTO_APPROVE | extra_auto_approve,
             streaming=(model_provider in ("openai", "ollama")),
