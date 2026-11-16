@@ -10,3 +10,6 @@ build/
 contact_classifier/*.csv
 *token*.json
 *credentials*.json
+
+# Eval results stay local
+agent_loop/evals/results/
